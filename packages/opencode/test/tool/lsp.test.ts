@@ -30,7 +30,7 @@ const ctx = {
   ask: () => Effect.void,
 }
 
-const workspaceSymbolQueries: string[] = []
+const workspaceSymbolCalls: { file: string; query: string }[] = []
 
 const lsp = Layer.succeed(
   LSP.Service,
@@ -45,9 +45,9 @@ const lsp = Layer.succeed(
     references: () => Effect.succeed([]),
     implementation: () => Effect.succeed([]),
     documentSymbol: () => Effect.succeed([]),
-    workspaceSymbol: (query) =>
+    workspaceSymbol: (file, query) =>
       Effect.sync(() => {
-        workspaceSymbolQueries.push(query)
+        workspaceSymbolCalls.push({ file, query })
         return []
       }),
     prepareCallHierarchy: () => Effect.succeed([]),
@@ -147,7 +147,7 @@ describe("tool.lsp", () => {
       () =>
         Effect.gen(function* () {
           const dir = (yield* TestInstance).directory
-          workspaceSymbolQueries.length = 0
+          workspaceSymbolCalls.length = 0
           const file = path.join(dir, "test.ts")
           yield* put(file)
 
@@ -169,14 +169,17 @@ describe("tool.lsp", () => {
       () =>
         Effect.gen(function* () {
           const dir = (yield* TestInstance).directory
-          workspaceSymbolQueries.length = 0
+          workspaceSymbolCalls.length = 0
           const file = path.join(dir, "test.ts")
           yield* put(file)
 
           yield* run({ operation: "workspaceSymbol", filePath: file, line: 3, character: 7, query: "TestSymbol" })
           yield* run({ operation: "workspaceSymbol", filePath: file, line: 3, character: 7 })
 
-          expect(workspaceSymbolQueries).toEqual(["TestSymbol", ""])
+          expect(workspaceSymbolCalls).toEqual([
+            { file, query: "TestSymbol" },
+            { file, query: "" },
+          ])
         }),
       { git: true },
     )

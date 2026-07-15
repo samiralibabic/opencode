@@ -143,6 +143,35 @@ describe("LSPClient interop", () => {
     await client.shutdown()
   })
 
+  test("automatically handles build prompts only for Metals", async () => {
+    const request = async (serverID: string) => {
+      const handle = spawnFakeServer() as any
+      const client = await withTestInstance({
+        directory: process.cwd(),
+        fn: (ctx) =>
+          LSPClient.create({
+            serverID,
+            server: handle as unknown as LSPServer.Handle,
+            root: process.cwd(),
+            directory: process.cwd(),
+            instance: ctx,
+          }),
+      })
+
+      try {
+        return await client.connection.sendRequest("test/request-show-message", {
+          message: "Import build?",
+          actions: [{ title: "Import build" }, { title: "Not now" }],
+        })
+      } finally {
+        await client.shutdown()
+      }
+    }
+
+    expect(await request("metals")).toEqual({ title: "Import build" })
+    expect(await request("fake")).toBeNull()
+  })
+
   test("sends ranged didChange for incremental sync servers", async () => {
     const handle = spawnFakeServer() as any
     await using tmp = await tmpdir()

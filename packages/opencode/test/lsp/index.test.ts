@@ -1,4 +1,5 @@
 import { describe, expect, spyOn } from "bun:test"
+import fs from "fs/promises"
 import path from "path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Deferred, Effect, Layer } from "effect"
@@ -151,6 +152,34 @@ describe("lsp.spawn", () => {
         },
       },
     },
+  )
+
+  it.instance(
+    "uses nearest Scala build root for Metals",
+    () =>
+      LSP.Service.use((lsp) =>
+        Effect.gen(function* () {
+          const dir = (yield* TestInstance).directory
+          const spy = spyOn(LSPServer.Metals, "spawn").mockResolvedValue(undefined)
+          const root = path.join(dir, "machdudas")
+          const file = path.join(root, "src", "main", "scala", "Main.scala")
+
+          try {
+            yield* Effect.promise(() => fs.mkdir(path.dirname(file), { recursive: true }))
+            yield* Effect.promise(() => Bun.write(path.join(root, "build.sbt"), ""))
+            yield* lsp.hover({
+              file,
+              line: 0,
+              character: 0,
+            })
+            expect(spy).toHaveBeenCalledTimes(1)
+            expect(spy.mock.calls[0]?.[0]).toBe(root)
+          } finally {
+            spy.mockRestore()
+          }
+        }),
+      ),
+    { config: { lsp: true } },
   )
 
   it.instance(

@@ -134,6 +134,12 @@ function handle(raw) {
     return
   }
 
+  if (data.method === "test/request-show-message") {
+    const id = sendRequest("window/showMessageRequest", data.params)
+    pendingClientRequests.set(id, data.id)
+    return
+  }
+
   if (data.method === "initialized" || data.method === "workspace/didChangeConfiguration") {
     return
   }

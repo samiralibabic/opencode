@@ -58,6 +58,19 @@ type CapabilityRegistration = {
   }
 }
 
+type MessageActionItem = {
+  title: string
+}
+
+type ShowMessageRequestParams = {
+  type?: number
+  message?: string
+  actions?: MessageActionItem[]
+}
+
+const METALS_PROMPT_ACTIONS = new Set(["import build", "import changes", "connect"])
+const BUILD_TOOL_ACTIONS = new Set(["bloop", "sbt", "mill", "maven", "gradle", "scala-cli"])
+
 type ServerCapabilities = {
   textDocumentSync?:
     | number
@@ -78,6 +91,16 @@ function getSyncKind(capabilities?: ServerCapabilities) {
   const sync = capabilities.textDocumentSync
   if (typeof sync === "number") return sync
   return sync?.change
+}
+
+function selectMessageAction(params: ShowMessageRequestParams) {
+  const actions = params.actions ?? []
+  const preferred = actions.find((action) => METALS_PROMPT_ACTIONS.has(action.title.toLowerCase()))
+  if (preferred) return preferred
+
+  const buildToolActions = actions.filter((action) => BUILD_TOOL_ACTIONS.has(action.title.toLowerCase()))
+  if (buildToolActions.length === 1) return buildToolActions[0]
+  return null
 }
 
 function endPosition(text: string) {
@@ -172,6 +195,12 @@ export async function create(input: {
   })
   connection.onRequest("window/workDoneProgress/create", (params) => {
     return null
+  })
+  connection.onNotification("window/showMessage", () => {})
+  connection.onRequest("window/showMessageRequest", (params) => {
+    if (input.serverID !== "metals") return null
+    const request = params as ShowMessageRequestParams
+    return selectMessageAction(request)
   })
   connection.onRequest("workspace/configuration", async (params) => {
     const items = (params as { items?: { section?: string }[] }).items ?? []

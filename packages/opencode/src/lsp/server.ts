@@ -21,6 +21,16 @@ const pathExists = async (p: string) =>
     .catch(() => false)
 const run = (cmd: string[], opts: Process.RunOptions = {}) => Process.run(cmd, { ...opts, nothrow: true })
 const output = (cmd: string[], opts: Process.RunOptions = {}) => Process.text(cmd, { ...opts, nothrow: true })
+const JsRootMarkers = [
+  "package.json",
+  "tsconfig.json",
+  "jsconfig.json",
+  "package-lock.json",
+  "bun.lockb",
+  "bun.lock",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+]
 
 export interface Handle {
   process: ChildProcessWithoutNullStreams
@@ -114,13 +124,10 @@ export const Deno: Info = {
 
 export const Typescript: Info = {
   id: "typescript",
-  root: NearestRoot(
-    ["package-lock.json", "bun.lockb", "bun.lock", "pnpm-lock.yaml", "yarn.lock"],
-    ["deno.json", "deno.jsonc"],
-  ),
+  root: NearestRoot(JsRootMarkers, ["deno.json", "deno.jsonc"]),
   extensions: [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"],
-  async spawn(root, ctx) {
-    const tsserver = Module.resolve("typescript/lib/tsserver.js", ctx.directory)
+  async spawn(root) {
+    const tsserver = Module.resolve("typescript/lib/tsserver.js", root)
     if (!tsserver) return
     const bin = await Npm.which("typescript-language-server")
     if (!bin) return
@@ -144,7 +151,7 @@ export const Typescript: Info = {
 export const Vue: Info = {
   id: "vue",
   extensions: [".vue"],
-  root: NearestRoot(["package-lock.json", "bun.lockb", "bun.lock", "pnpm-lock.yaml", "yarn.lock"]),
+  root: NearestRoot(JsRootMarkers),
   async spawn(root, _ctx, flags) {
     let binary = which("vue-language-server")
     const args: string[] = []
@@ -172,10 +179,10 @@ export const Vue: Info = {
 
 export const ESLint: Info = {
   id: "eslint",
-  root: NearestRoot(["package-lock.json", "bun.lockb", "bun.lock", "pnpm-lock.yaml", "yarn.lock"]),
+  root: NearestRoot(JsRootMarkers),
   extensions: [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue"],
-  async spawn(root, ctx, flags) {
-    const eslint = Module.resolve("eslint", ctx.directory)
+  async spawn(root, _ctx, flags) {
+    const eslint = Module.resolve("eslint", root)
     if (!eslint) return
     const serverPath = path.join(Global.Path.bin, "vscode-eslint", "server", "out", "eslintServer.js")
     if (!(await Filesystem.exists(serverPath))) {
@@ -1096,12 +1103,10 @@ export const Svelte: Info = {
 export const Astro: Info = {
   id: "astro",
   extensions: [".astro"],
-  root: NearestRoot(["package-lock.json", "bun.lockb", "bun.lock", "pnpm-lock.yaml", "yarn.lock"]),
-  async spawn(root, ctx, flags) {
-    const tsserver = Module.resolve("typescript/lib/tsserver.js", ctx.directory)
-    if (!tsserver) {
-      return
-    }
+  root: NearestRoot(JsRootMarkers),
+  async spawn(root, _ctx, flags) {
+    const tsserver = Module.resolve("typescript/lib/tsserver.js", root)
+    if (!tsserver) return
     const tsdk = path.dirname(tsserver)
 
     let binary = which("astro-ls")
@@ -1506,6 +1511,31 @@ export const LuaLS: Info = {
 
     return {
       process: spawn(bin, {
+        cwd: root,
+      }),
+    }
+  },
+}
+
+export const Metals: Info = {
+  id: "metals",
+  extensions: [".scala", ".sbt", ".sc"],
+  root: NearestRoot([
+    "build.sbt",
+    "build.sc",
+    "build.mill",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    ".bloop",
+  ]),
+  async spawn(root) {
+    const metals = which("metals")
+    if (!metals) {
+      return
+    }
+    return {
+      process: spawn(metals, {
         cwd: root,
       }),
     }

@@ -28,12 +28,15 @@ const DiagnosticsCommand = effectCmd({
 })
 
 export const SymbolsCommand = effectCmd({
-  command: "symbols <query>",
+  command: "symbols <file> <query>",
   describe: "search workspace symbols",
-  builder: (yargs) => yargs.positional("query", { type: "string", demandOption: true }),
+  builder: (yargs) =>
+    yargs
+      .positional("file", { type: "string", demandOption: true })
+      .positional("query", { type: "string", demandOption: true }),
   handler: Effect.fn("Cli.debug.lsp.symbols")(function* (args) {
     yield* Effect.logInfo("symbols")
-    const results = yield* LSP.Service.use((lsp) => lsp.workspaceSymbol(args.query))
+    const results = yield* LSP.Service.use((lsp) => lsp.workspaceSymbol(args.file, args.query))
     process.stdout.write(JSON.stringify(results, null, 2) + EOL)
   }),
 })
