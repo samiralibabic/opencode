@@ -1,6 +1,6 @@
 import { createStore } from "solid-js/store"
 import { createSimpleContext } from "./helper"
-import { batch, createEffect, createMemo } from "solid-js"
+import { batch, createEffect, createMemo, createSignal } from "solid-js"
 import { useSync } from "./sync"
 import { useEvent } from "./event"
 import path from "path"
@@ -135,31 +135,51 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     const agent = createAgent()
 
     function createModel() {
+      type Model = { providerID: string; modelID: string }
+      type Selection = { model?: Model; variant?: string }
       const [modelStore, setModelStore] = createStore<{
         ready: boolean
-        model: Record<
-          string,
-          {
-            providerID: string
-            modelID: string
-          }
-        >
-        recent: {
-          providerID: string
-          modelID: string
-        }[]
-        favorite: {
-          providerID: string
-          modelID: string
-        }[]
-        variant: Record<string, string | undefined>
+        selection: Record<string, Selection>
+        recent: Model[]
+        favorite: Model[]
       }>({
         ready: false,
-        model: {},
+        selection: {},
         recent: [],
         favorite: [],
-        variant: {},
       })
+      const [draft, setDraft] = createSignal(0)
+      let previousRoute = route.data.type
+
+      createEffect(() => {
+        const current = route.data.type
+        if (current !== "session" && previousRoute === "session") setDraft((value) => value + 1)
+        previousRoute = current
+      })
+
+      function scopedSelectionKey(scope: string, agentName: string) {
+        return `${scope}:agent:${agentName}`
+      }
+
+      function sessionSelectionKey(sessionID: string, agentName: string) {
+        return scopedSelectionKey(`session:${sessionID}`, agentName)
+      }
+
+      function draftSelectionKey(agentName: string) {
+        return scopedSelectionKey(`draft:${draft()}`, agentName)
+      }
+
+      function selectionKey(agentName = agent.current()?.name): string | undefined {
+        if (!agentName) return undefined
+        if (route.data.type === "session") return sessionSelectionKey(route.data.sessionID, agentName)
+        return draftSelectionKey(agentName)
+      }
+
+      function selection(): Selection | undefined {
+        const key = selectionKey()
+        if (!key) return undefined
+        return modelStore.selection[key]
+      }
 
       const filePath = path.join(paths.state, "model.json")
       const state = {
@@ -175,7 +195,6 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         void writeJsonAtomic(filePath, {
           recent: modelStore.recent,
           favorite: modelStore.favorite,
-          variant: modelStore.variant,
         })
       }
 
@@ -185,8 +204,6 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           const value = x as Record<string, unknown>
           if (Array.isArray(value.recent)) setModelStore("recent", value.recent)
           if (Array.isArray(value.favorite)) setModelStore("favorite", value.favorite)
-          if (typeof value.variant === "object" && value.variant !== null)
-            setModelStore("variant", value.variant as Record<string, string | undefined>)
         })
         .catch(() => {})
         .finally(() => {
@@ -194,7 +211,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           if (state.pending) save()
         })
 
-      const fallbackModel = createMemo(() => {
+      const commandLineModel = createMemo(() => {
         if (args.model) {
           const { providerID, modelID } = parseModel(args.model)
           if (isModelValid({ providerID, modelID })) {
@@ -204,7 +221,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             }
           }
         }
+        return undefined
+      })
 
+      const fallbackModel = createMemo(() => {
         if (sync.data.config.model) {
           const { providerID, modelID } = parseModel(sync.data.config.model)
           if (isModelValid({ providerID, modelID })) {
@@ -237,12 +257,27 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         const a = agent.current()
         return (
           getFirstValidModel(
-            () => a && modelStore.model[a.name],
+            () => selection()?.model,
+            commandLineModel,
             () => a && a.model,
             fallbackModel,
           ) ?? undefined
         )
       })
+
+      function configuredVariant(): string | undefined {
+        const a = agent.current()
+        const current = currentModel()
+        if (!a || !current) return undefined
+        const provider = sync.data.provider.find((item) => item.id === current.providerID)
+        const variants = provider?.models[current.modelID]?.variants
+        if (!variants) return undefined
+        const same = a.model?.providerID === current.providerID && a.model.modelID === current.modelID
+        if (same && a.variant && a.variant in variants) return a.variant
+        const effort = a.options.reasoningEffort
+        if (typeof effort === "string" && effort in variants) return effort
+        return undefined
+      }
 
       return {
         current: currentModel,
@@ -283,9 +318,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           if (next >= recent.length) next = 0
           const val = recent[next]
           if (!val) return
-          const a = agent.current()
-          if (!a) return
-          setModelStore("model", a.name, { ...val })
+          this.set(val)
         },
         cycleFavorite(direction: 1 | -1) {
           const favorites = modelStore.favorite.filter((item) => isModelValid(item))
@@ -311,13 +344,11 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           }
           const next = favorites[index]
           if (!next) return
-          const a = agent.current()
-          if (!a) return
-          setModelStore("model", a.name, { ...next })
+          this.set(next)
           setModelStore("recent", recentModels(next, modelStore.recent))
           save()
         },
-        set(model: { providerID: string; modelID: string }, options?: { recent?: boolean }) {
+        set(model: Model, options?: { recent?: boolean }) {
           batch(() => {
             if (!isModelValid(model)) {
               toast.show({
@@ -327,14 +358,38 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
               })
               return
             }
-            const a = agent.current()
-            if (!a) return
-            setModelStore("model", a.name, model)
+            const key = selectionKey()
+            if (!key) return
+            const current = modelStore.selection[key]
+            const same = current?.model?.providerID === model.providerID && current.model.modelID === model.modelID
+            setModelStore("selection", key, { ...current, model })
+            if (!same) setModelStore("selection", key, "variant", undefined)
             if (options?.recent) {
               setModelStore("recent", recentModels(model, modelStore.recent))
               save()
             }
           })
+        },
+        restore(sessionID: string, agentName: string, model: Model & { variant?: string }) {
+          if (commandLineModel() || !isModelValid(model)) return
+          const key = sessionSelectionKey(sessionID, agentName)
+          if (modelStore.selection[key]) return
+          setModelStore("selection", key, {
+            model: { providerID: model.providerID, modelID: model.modelID },
+            variant: model.variant,
+          })
+        },
+        promote(sessionID: string) {
+          const prefix = `draft:${draft()}:agent:`
+          for (const [key, value] of Object.entries(modelStore.selection)) {
+            if (!key.startsWith(prefix)) continue
+            const agentName = key.slice(prefix.length)
+            const target = sessionSelectionKey(sessionID, agentName)
+            if (!modelStore.selection[target]) setModelStore("selection", target, { ...value })
+          }
+        },
+        resetDraft() {
+          setDraft((value) => value + 1)
         },
         toggleFavorite(model: { providerID: string; modelID: string }) {
           batch(() => {
@@ -361,16 +416,23 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         },
         variant: {
           selected() {
-            const m = currentModel()
-            if (!m) return undefined
-            const key = `${m.providerID}/${m.modelID}`
-            return modelStore.variant[key]
+            const value = selection()
+            const current = currentModel()
+            if (!value?.model || !current) return undefined
+            if (value.model.providerID !== current.providerID || value.model.modelID !== current.modelID)
+              return undefined
+            return value.variant
           },
           current() {
+            const request = this.request()
+            if (request) return request
+            return configuredVariant()
+          },
+          request() {
             const v = this.selected()
-            if (!v) return undefined
-            if (!this.list().includes(v)) return undefined
-            return v
+            if (v === "default") return undefined
+            if (v && this.list().includes(v)) return v
+            return undefined
           },
           list() {
             const m = currentModel()
@@ -383,20 +445,35 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           set(value: string | undefined) {
             const m = currentModel()
             if (!m) return
-            const key = `${m.providerID}/${m.modelID}`
-            setModelStore("variant", key, value ?? "default")
-            save()
+            const key = selectionKey()
+            if (!key) return
+            setModelStore("selection", key, { model: m, variant: value ?? "default" })
           },
           cycle() {
             const variants = this.list()
             if (variants.length === 0) return
-            const current = this.current()
-            if (!current) {
+            const selected = this.selected()
+            if (selected === "default") {
               this.set(variants[0])
               return
             }
-            const index = variants.indexOf(current)
-            if (index === -1 || index === variants.length - 1) {
+            if (selected && variants.includes(selected)) {
+              const index = variants.indexOf(selected)
+              if (index === variants.length - 1) this.set(undefined)
+              else this.set(variants[index + 1])
+              return
+            }
+            const configured = configuredVariant()
+            if (!configured) {
+              this.set(variants[0])
+              return
+            }
+            const index = variants.indexOf(configured)
+            if (index === variants.length - 1) {
+              this.set(variants[0])
+              return
+            }
+            if (index === -1) {
               this.set(undefined)
               return
             }

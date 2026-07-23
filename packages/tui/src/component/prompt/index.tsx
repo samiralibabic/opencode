@@ -324,10 +324,7 @@ export function Prompt(props: PromptProps) {
       if (msg.agent && isPrimaryAgent) {
         // Keep command line --agent if specified.
         if (!args.agent) local.agent.set(msg.agent)
-        if (msg.model) {
-          local.model.set(msg.model)
-          local.model.variant.set(msg.model.variant)
-        }
+        if (msg.model) local.model.restore(sessionID, msg.agent, msg.model)
       }
     }
   })
@@ -986,7 +983,7 @@ export function Prompt(props: PromptProps) {
       return false
     }
 
-    const variant = local.model.variant.current()
+    const variant = local.model.variant.request()
     let sessionID = props.sessionID
     let finishMoveProgress = false
     if (sessionID == null) {
@@ -1021,6 +1018,7 @@ export function Prompt(props: PromptProps) {
       }
 
       sessionID = res.data.id
+      local.model.promote(sessionID)
     }
 
     const inputText = expandTrackedPastedText(
