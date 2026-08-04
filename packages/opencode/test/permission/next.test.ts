@@ -875,7 +875,7 @@ it.instance(
 )
 
 it.instance(
-  "reply - always keeps other session pending",
+  "reply - always resolves matching requests across sessions and keeps nonmatching requests pending",
   () =>
     Effect.gen(function* () {
       const a = yield* ask({
@@ -888,7 +888,7 @@ it.instance(
         ruleset: [],
       }).pipe(Effect.forkScoped)
 
-      const b = yield* ask({
+      const matching = yield* ask({
         id: PermissionV1.ID.make("per_test6b"),
         sessionID: SessionID.make("session_b"),
         permission: "bash",
@@ -898,14 +898,25 @@ it.instance(
         ruleset: [],
       }).pipe(Effect.forkScoped)
 
-      yield* waitForPending(2)
+      const nonmatching = yield* ask({
+        id: PermissionV1.ID.make("per_test6c"),
+        sessionID: SessionID.make("session_c"),
+        permission: "edit",
+        patterns: ["foo.ts"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+
+      yield* waitForPending(3)
       yield* reply({ requestID: PermissionV1.ID.make("per_test6a"), reply: "always" })
 
       yield* Fiber.join(a)
-      expect((yield* list()).map((item) => item.id)).toEqual([PermissionV1.ID.make("per_test6b")])
+      yield* Fiber.join(matching)
+      expect((yield* list()).map((item) => item.id)).toEqual([PermissionV1.ID.make("per_test6c")])
 
       yield* rejectAll()
-      yield* Fiber.await(b)
+      yield* Fiber.await(nonmatching)
     }),
   { git: true },
 )

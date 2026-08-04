@@ -3,6 +3,7 @@ import { dirname } from "node:path"
 import { createMemo, For, Match, Show, Switch } from "solid-js"
 import { Portal, useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
 import type { TextareaRenderable } from "@opentui/core"
+import stripAnsi from "strip-ansi"
 import { useTheme, selectedForeground } from "../../context/theme"
 import type { PermissionRequest } from "@opencode-ai/sdk/v2"
 import { useSDK } from "../../context/sdk"
@@ -18,6 +19,17 @@ import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut } from "../../keyma
 import { usePathFormatter } from "../../context/path-format"
 
 type PermissionStage = "permission" | "always" | "reject"
+
+function displayText(value: unknown, limit: number) {
+  if (typeof value !== "string") return ""
+  return Locale.truncate(
+    stripAnsi(value)
+      .replace(/[ \t]*[\r\n]+[ \t]*/g, " ")
+      .replace(/[\u0000-\u0009\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "")
+      .trim(),
+    limit,
+  )
+}
 
 function EditBody(props: { request: PermissionRequest }) {
   const themeState = useTheme()
@@ -118,6 +130,14 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
   const pathFormatter = usePathFormatter()
 
   const session = createMemo(() => sync.data.session.find((s) => s.id === props.request.sessionID))
+  const attribution = createMemo(() => {
+    const current = session()
+    if (!current?.parentID) return
+    const agent = displayText(current.agent, 40)
+    const title = displayText(current.title, 60)
+    if (!agent && !title) return
+    return `From ${[agent ? `@${agent}` : "", title].filter(Boolean).join(" · ")}`
+  })
 
   const input = createMemo(() => {
     const tool = props.request.tool
@@ -333,6 +353,7 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
               const meta = props.request.metadata ?? {}
               const parent = typeof meta["parentDir"] === "string" ? meta["parentDir"] : undefined
               const filepath = typeof meta["filepath"] === "string" ? meta["filepath"] : undefined
+              const command = displayText(data.command, 120) || displayText(meta.command, 120)
               const pattern = props.request.patterns?.[0]
               const derived =
                 typeof pattern === "string" ? (pattern.includes("*") ? dirname(pattern) : pattern) : undefined
@@ -345,14 +366,21 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
                 icon: "←",
                 title: `Access external directory ${dir}`,
                 body: (
-                  <Show when={patterns.length > 0}>
-                    <box paddingLeft={1} gap={1}>
-                      <text fg={theme.textMuted}>Patterns</text>
-                      <box>
-                        <For each={patterns}>{(p) => <text fg={theme.text}>{"- " + p}</text>}</For>
+                  <box paddingLeft={1} flexDirection="column" gap={1}>
+                    <Show when={command}>
+                      <text fg={theme.textMuted} overflow="hidden" wrapMode="none">
+                        {"Command: " + command}
+                      </text>
+                    </Show>
+                    <Show when={patterns.length > 0}>
+                      <box flexDirection="column">
+                        <text fg={theme.textMuted}>Patterns</text>
+                        <box>
+                          <For each={patterns}>{(p) => <text fg={theme.text}>{"- " + p}</text>}</For>
+                        </box>
                       </box>
-                    </box>
-                  </Show>
+                    </Show>
+                  </box>
                 ),
               }
             }
@@ -394,6 +422,13 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
                 </text>
                 <text fg={theme.text}>{current.title}</text>
               </box>
+              <Show when={attribution()}>
+                <box flexDirection="row" paddingLeft={2} paddingRight={1} flexShrink={0}>
+                  <text fg={theme.textMuted} flexGrow={1} overflow="hidden" wrapMode="none">
+                    {attribution()}
+                  </text>
+                </box>
+              </Show>
             </box>
           )
 
