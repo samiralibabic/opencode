@@ -120,4 +120,20 @@ describe("LSP server definitions", () => {
       npmWhich.mockRestore()
     }
   })
+
+  test("TypeScript spawn falls back to the launch directory", async () => {
+    await using tmp = await tmpdir()
+    const root = path.join(tmp.path, "workspace", "apps", "api")
+    const directory = path.join(tmp.path, "launch")
+    await fs.mkdir(root, { recursive: true })
+    await writeTypescript(directory)
+    const npmWhich = spyOn(Npm, "which").mockResolvedValue(undefined)
+
+    try {
+      await LSPServer.Typescript.spawn(root, createContext(directory), await flags())
+      expect(npmWhich).toHaveBeenCalledWith("typescript-language-server")
+    } finally {
+      npmWhich.mockRestore()
+    }
+  })
 })

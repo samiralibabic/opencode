@@ -126,8 +126,9 @@ export const Typescript: Info = {
   id: "typescript",
   root: NearestRoot(JsRootMarkers, ["deno.json", "deno.jsonc"]),
   extensions: [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"],
-  async spawn(root) {
-    const tsserver = Module.resolve("typescript/lib/tsserver.js", root)
+  async spawn(root, ctx) {
+    const tsserver =
+      Module.resolve("typescript/lib/tsserver.js", root) ?? Module.resolve("typescript/lib/tsserver.js", ctx.directory)
     if (!tsserver) return
     const bin = await Npm.which("typescript-language-server")
     if (!bin) return
