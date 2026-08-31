@@ -1525,6 +1525,40 @@ describe("run stream transport", () => {
     }
   })
 
+  test("fails bootstrap when descendant discovery fails", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const children = (async ({ sessionID }: { sessionID: string }) => {
+      if (sessionID === "session-1") return ok([child("child-1")])
+      return {
+        data: undefined,
+        error: {
+          name: "NotFoundError",
+          data: { message: "child lookup failed" },
+        },
+        request: new Request("https://opencode.test"),
+        response: new Response(undefined, { status: 404 }),
+      }
+    }) as OpencodeClient["session"]["children"]
+    const result = createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        children,
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    try {
+      await expect(result).rejects.toThrow("failed to list child sessions for child-1")
+    } finally {
+      src.close()
+      await result.then((transport) => transport.close()).catch(() => undefined)
+    }
+  })
+
   test("bootstraps child session output before selection", async () => {
     const ui = footer()
     const transport = await createSessionTransport({

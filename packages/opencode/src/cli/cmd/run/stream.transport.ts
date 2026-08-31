@@ -400,8 +400,12 @@ const collectDescendantSessions = Effect.fn("RunStreamTransport.collectDescendan
     const levels = yield* Effect.all(
       frontier.map((sessionID) =>
         Effect.promise(() => sdk.session.children({ sessionID })).pipe(
-          Effect.map((item) => item.data ?? []),
-          Effect.orElseSucceed(() => []),
+          Effect.flatMap((item) => {
+            if (item.error) {
+              return Effect.fail(new Error(`failed to list child sessions for ${sessionID}`, { cause: item.error }))
+            }
+            return Effect.succeed(item.data ?? [])
+          }),
         ),
       ),
       { concurrency: "unbounded" },
