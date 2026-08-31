@@ -232,7 +232,7 @@ export function Session() {
       : [],
   )
   const subtree = createMemo(() => {
-    // NOTE: 仅根会话收集整棵子树的权限/问题；子会话自身不重复收集（避免与父视图双重展示）
+    // Only root sessions collect subtree requests; child views do not duplicate them.
     const s = session()
     if (!s || s.parentID) return []
     return collectSubtree(sync.data.session, s.id)
