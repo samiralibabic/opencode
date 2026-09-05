@@ -4,6 +4,7 @@ import { AgentV2 } from "@opencode-ai/core/agent"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Location } from "@opencode-ai/core/location"
 import { AgentPlugin } from "@opencode-ai/core/plugin/agent"
+import { SessionCompaction } from "@opencode-ai/core/session/compaction"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { location } from "./fixture/location"
 import { testEffect } from "./lib/effect"
@@ -123,6 +124,7 @@ describe("AgentV2", () => {
         "summary",
         "title",
       ])
+      expect((yield* agent.get(AgentV2.ID.make("compaction")))?.system).toBe(SessionCompaction.SUMMARY_SYSTEM_PROMPT)
       for (const item of agents) {
         expect(item.permissions.some((rule) => rule.action === "bash" && rule.effect !== "deny")).toBe(false)
       }

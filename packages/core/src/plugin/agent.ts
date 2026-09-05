@@ -7,6 +7,7 @@ import { AgentV2 } from "../agent"
 import { Global } from "../global"
 import { Location } from "../location"
 import { PermissionV2 } from "../permission"
+import { SUMMARY_SYSTEM_PROMPT } from "../session/compaction"
 
 const TRUNCATION_GLOB = path.join(Global.Path.data, "tool-output", "*")
 const BUILD_SYSTEM =
@@ -29,12 +30,6 @@ Guidelines:
 - Do not create any files, or run bash commands that modify the user's system state in any way
 
 Complete the user's search request efficiently and report your findings clearly.`
-
-const PROMPT_COMPACTION = `You are a context summarization agent. You are given a conversation between a user and an agent. Your goal is to produce a structured summary matching the format specified so another coding agent can continue the work.
-
-Always follow the exact output structure requested by the user prompt. Keep every section, preserve exact file paths and identifiers when known, and prefer terse bullets over paragraphs.
-
-Do not continue the conversation. Do not respond to any questions in the conversation. Only output the structured summary in the exact format requested by the user prompt. Respond in the same language as the conversation.`
 
 const PROMPT_TITLE = `You are a title generator. You output ONLY a thread title. Nothing else.
 
@@ -180,7 +175,7 @@ export const Plugin = define({
       draft.update(AgentV2.ID.make("compaction"), (item) => {
         item.mode = "primary"
         item.hidden = true
-        item.system = PROMPT_COMPACTION
+        item.system = SUMMARY_SYSTEM_PROMPT
         item.permissions.push(...PermissionV2.merge(defaults, [{ action: "*", resource: "*", effect: "deny" }]))
       })
 

@@ -9,6 +9,7 @@ import { Auth } from "../../src/auth"
 import { Config } from "../../src/config/config"
 import { RuntimeFlags } from "../../src/effect/runtime-flags"
 import { Global } from "@opencode-ai/core/global"
+import { SessionCompaction } from "@opencode-ai/core/session/compaction"
 import { Permission } from "../../src/permission"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Plugin } from "../../src/plugin"
@@ -175,6 +176,7 @@ it.instance("compaction agent denies all permissions", () =>
     const compaction = yield* load((svc) => svc.get("compaction"))
     expect(compaction).toBeDefined()
     expect(compaction?.hidden).toBe(true)
+    expect(compaction?.prompt).toBe(SessionCompaction.SUMMARY_SYSTEM_PROMPT)
     expect(evalPerm(compaction, "bash")).toBe("deny")
     expect(evalPerm(compaction, "edit")).toBe("deny")
     expect(evalPerm(compaction, "read")).toBe("deny")

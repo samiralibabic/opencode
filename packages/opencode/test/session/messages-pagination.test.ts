@@ -604,6 +604,7 @@ describe("MessageV2.filterCompacted", () => {
 
         const result = MessageV2.filterCompacted(yield* MessageV2.stream(sessionID))
         expect(result).toHaveLength(5)
+        expect(MessageV2.hasRetainedCompactionTail(result)).toBe(false)
         // reversed from newest-first to chronological
         expect(result.map((item) => item.info.id)).toEqual(ids)
       }),
@@ -640,6 +641,7 @@ describe("MessageV2.filterCompacted", () => {
         // Includes compaction boundary: u1, a1, u2, a2
         expect(result[0].info.id).toBe(u1)
         expect(result.length).toBe(4)
+        expect(MessageV2.hasRetainedCompactionTail(result)).toBe(false)
       }),
     ),
   )
@@ -747,6 +749,7 @@ describe("MessageV2.filterCompacted", () => {
         const result = MessageV2.filterCompacted(yield* MessageV2.stream(sessionID))
 
         expect(result.map((item) => item.info.id)).toEqual([c1, s1, u2, a2, u3, a3])
+        expect(MessageV2.hasRetainedCompactionTail(result)).toBe(true)
       }),
     ),
   )
@@ -942,6 +945,35 @@ describe("MessageV2.filterCompacted", () => {
         const result = MessageV2.filterCompacted(yield* MessageV2.stream(sessionID))
 
         expect(result.map((item) => item.info.id)).toEqual([c2, s2, u3, a3, u4, a4])
+        expect(MessageV2.hasRetainedCompactionTail(result)).toBe(true)
+      }),
+    ),
+  )
+
+  it.instance("detects a retained tail containing an older compaction boundary", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const u1 = yield* addUser(sessionID, "first")
+        const a1 = yield* addAssistant(sessionID, u1, { finish: "end_turn" })
+
+        const c1 = yield* addUser(sessionID)
+        yield* addCompactionPart(sessionID, c1, u1)
+        yield* addAssistant(sessionID, c1, { summary: true, finish: "end_turn" })
+
+        yield* addUser(sessionID, "between compactions")
+
+        const c2 = yield* addUser(sessionID)
+        yield* addCompactionPart(sessionID, c2, u1)
+        const s2 = yield* addAssistant(sessionID, c2, { summary: true, finish: "end_turn" })
+        const latest = yield* addUser(sessionID, "latest")
+
+        const result = MessageV2.filterCompacted(yield* MessageV2.stream(sessionID))
+
+        expect(result[0]?.info.id).toBe(c2)
+        expect(result[1]?.info.id).toBe(s2)
+        expect(result.map((item) => item.info.id)).toContain(a1)
+        expect(result.at(-1)?.info.id).toBe(latest)
+        expect(MessageV2.hasRetainedCompactionTail(result)).toBe(true)
       }),
     ),
   )

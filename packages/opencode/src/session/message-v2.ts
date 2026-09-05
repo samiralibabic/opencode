@@ -575,6 +575,25 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
   return filterCompacted(yield* stream(sessionID))
 })
 
+export function hasRetainedCompactionTail(msgs: WithParts[]) {
+  return msgs.some((compaction, compactionIndex) => {
+    if (compaction.info.role !== "user") return false
+    const part = compaction.parts.find(
+      (item): item is CompactionPart => item.type === "compaction" && item.tail_start_id !== undefined,
+    )
+    if (!part) return false
+    const summaryIndex = msgs.findIndex(
+      (msg, index) =>
+        index > compactionIndex &&
+        msg.info.role === "assistant" &&
+        msg.info.summary &&
+        msg.info.parentID === compaction.info.id,
+    )
+    if (summaryIndex < 0) return false
+    return msgs.findIndex((msg, index) => index > summaryIndex && msg.info.id === part.tail_start_id) > summaryIndex
+  })
+}
+
 // filterCompacted reorders messages for model consumption
 // ([compaction-user, summary, ...retained tail..., continue-user]), so array
 // position is not chronological. IDs are only a deterministic tie-breaker

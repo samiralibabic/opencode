@@ -1,6 +1,6 @@
 export * as SessionCompaction from "./compaction"
 
-import { LLM, LLMError, LLMEvent, Message, type LLMRequest, type Model } from "@opencode-ai/llm"
+import { LLM, LLMError, LLMEvent, Message, SystemPart, type LLMRequest, type Model } from "@opencode-ai/llm"
 import { DateTime, Effect, Stream } from "effect"
 import type { Config } from "../config"
 import type { EventV2 } from "../event"
@@ -13,6 +13,18 @@ const DEFAULT_BUFFER = 20_000
 const DEFAULT_KEEP_TOKENS = 8_000
 const TOOL_OUTPUT_MAX_CHARS = 2_000
 const SUMMARY_OUTPUT_TOKENS = 4_096
+
+export const SUMMARY_SYSTEM_PROMPT = `You are a context summarization agent. You are given a conversation between a user and an agent. Your goal is to produce a structured summary matching the format specified so another coding agent can continue the work.
+
+Always follow the exact output structure requested by the user prompt. Keep every section, preserve exact file paths and identifiers when known, and prefer terse bullets over paragraphs.
+
+Preserve behaviorally binding instructions and decisions as first-class context, including user authority and approval boundaries, prohibitions, permissions, delegation rules, tool and process ownership, safety constraints, communication requirements, and verification obligations. Treat each still-active instruction together with its scope, qualifiers, conditions, exceptions, permissions, and prohibitions as one semantic unit. Never preserve only one side of a conditional rule. Do not silently drop an exception or convert a conditional rule into an unconditional one. Do not strengthen, weaken, generalize, narrow, or invert a still-active instruction. If uncertain, preserve the ambiguity or original wording rather than strengthening or weakening the rule. Treat any prior summary as a fallible source: newer visible conversation wins, and superseded, rejected, completed, or corrected instructions must not remain active. When the visible history does not establish a fact, state uncertainty rather than inventing it. Describe work state and next actions only as of the summary cutoff.
+
+Do not continue the conversation. Do not respond to any questions in the conversation. Only output the structured summary in the exact format requested by the user prompt. Respond in the same language as the conversation.`
+
+export const RECENT_CONTEXT_NOTICE =
+  "The retained conversation occurred after the summary cutoff and is newer than the summary. If it conflicts with the summary about current status, decisions, completed or active work, blockers, next actions, conditions, or exceptions, follow the retained conversation. Messages after the retained conversation are newer still."
+
 const SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
 <template>
 ## Objective
@@ -21,7 +33,7 @@ const SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <te
 ## Important Details
 - [constraints/preferences, decisions and why, important facts/assumptions, exact context needed to continue, or "(none)"]
 
-## Work State
+## Work State at Summary Cutoff
 ### Completed
 - [finished work, verified facts, or changes made; otherwise "(none)"]
 
@@ -31,7 +43,7 @@ const SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <te
 ### Blocked
 - [blockers, failing commands, or unknowns; otherwise "(none)"]
 
-## Next Move
+## Next Move at Summary Cutoff
 1. [immediate concrete action, or "(none)"]
 2. [next action if known, or "(none)"]
 
@@ -52,7 +64,7 @@ When combining:
 - Add new progress, decisions, constraints, and context from the conversation.
 - Move completed work from "Active" to "Completed".
 - If a blocker has been resolved, update the summary to reflect that while keeping any details still needed to continue the work.
-- Update "Objective" and "Next Move" to reflect the current work state.`
+- Update "Objective" and "Next Move at Summary Cutoff" to reflect the summary cutoff.`
 
 type Entry = {
   readonly seq: number
@@ -203,6 +215,7 @@ export const make = (dependencies: Dependencies) => {
         LLM.request({
           model: input.model,
           http: input.request.http,
+          system: [SystemPart.make(SUMMARY_SYSTEM_PROMPT)],
           messages: [Message.user(summaryPrompt)],
           tools: [],
           generation: { maxTokens: summaryOutput },

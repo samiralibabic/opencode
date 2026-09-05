@@ -40,6 +40,7 @@ import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { Config } from "@opencode-ai/core/config"
 import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
+import { SessionCompaction } from "@opencode-ai/core/session/compaction"
 import { Tool } from "@opencode-ai/core/tool/tool"
 import {
   SessionContextEpochTable,
@@ -1101,6 +1102,7 @@ describe("SessionRunnerLLM", () => {
       yield* session.resume(sessionID)
 
       expect(requests).toHaveLength(2)
+      expect(requests[0]?.system.map((part) => part.text)).toEqual([SessionCompaction.SUMMARY_SYSTEM_PROMPT])
       expect(requests.map((request) => request.http?.headers)).toEqual([
         {
           "x-session-affinity": sessionID,
@@ -1114,6 +1116,8 @@ describe("SessionRunnerLLM", () => {
       expect(userTexts(requests[0])[0]).toContain("## Objective")
       expect(userTexts(requests[1])).toHaveLength(1)
       expect(userTexts(requests[1])[0]).toContain("<summary>\n## Objective\n- Preserve the task\n</summary>")
+      expect(requests[1]?.system.map((part) => part.text)).toContain(SessionCompaction.RECENT_CONTEXT_NOTICE)
+      expect(userTexts(requests[1])[0]).not.toContain(SessionCompaction.RECENT_CONTEXT_NOTICE)
       expect(userTexts(requests[1])[0]).toContain(`[User]: ${"Recent exact request ".repeat(180)}`)
 
       const context = yield* (yield* SessionStore.Service).context(sessionID)
@@ -1122,6 +1126,7 @@ describe("SessionRunnerLLM", () => {
         type: "compaction",
         summary: "## Objective\n- Preserve the task",
       })
+      expect(JSON.stringify(context[0])).not.toContain(SessionCompaction.RECENT_CONTEXT_NOTICE)
 
       requests.length = 0
       executions.length = 0
@@ -1205,6 +1210,7 @@ describe("SessionRunnerLLM", () => {
       expect(summary).toContain(oversized)
       expect(continuation).not.toContain("OVERSIZED_BOUNDARY")
       expect(continuation).not.toContain("OVERSIZED_END")
+      expect(requests[1]?.system.map((part) => part.text)).not.toContain(SessionCompaction.RECENT_CONTEXT_NOTICE)
       expect(continuation).toContain("<recent-context>\n\n</recent-context>")
     }),
   )

@@ -3,6 +3,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { RECENT_CONTEXT_NOTICE } from "@opencode-ai/core/session/compaction"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
@@ -578,6 +579,101 @@ withMcpInstructions.instance(
       yield* Fiber.interrupt(fiber)
     }),
   15_000,
+)
+
+it.instance("adds retained-tail precedence only to model system context", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const retained = yield* seed(chat.id, { finish: "stop" })
+    const marker = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      time: { created: Date.now() },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: marker.id,
+      sessionID: chat.id,
+      type: "compaction",
+      auto: false,
+      tail_start_id: retained.user.id,
+    })
+    const summary: SessionV1.Assistant = {
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: marker.id,
+      sessionID: chat.id,
+      mode: "compaction",
+      agent: "compaction",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now(), completed: Date.now() },
+      finish: "stop",
+      summary: true,
+    }
+    yield* sessions.updateMessage(summary)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: summary.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "older summary",
+    })
+    yield* user(chat.id, "between compactions")
+    const latestMarker = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      time: { created: Date.now() },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: latestMarker.id,
+      sessionID: chat.id,
+      type: "compaction",
+      auto: false,
+      tail_start_id: retained.user.id,
+    })
+    const latestSummary: SessionV1.Assistant = {
+      ...summary,
+      id: MessageID.ascending(),
+      parentID: latestMarker.id,
+      time: { created: Date.now(), completed: Date.now() },
+    }
+    yield* sessions.updateMessage(latestSummary)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: latestSummary.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "stale summary",
+    })
+    yield* user(chat.id, "newest request")
+
+    yield* llm.hang
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "timed out waiting for retained-tail request", "10 seconds")
+
+    const hit = (yield* llm.hits)[0]
+    const messages = (hit?.body.messages ?? []) as Array<{ role?: string; content?: unknown }>
+    const system = JSON.stringify(messages.filter((message) => message.role === "system"))
+    expect(system).toContain(RECENT_CONTEXT_NOTICE)
+    expect(system.split(RECENT_CONTEXT_NOTICE)).toHaveLength(2)
+    expect(JSON.stringify(messages.filter((message) => message.role === "user"))).not.toContain(RECENT_CONTEXT_NOTICE)
+    expect(JSON.stringify(yield* sessions.messages({ sessionID: chat.id }))).not.toContain(RECENT_CONTEXT_NOTICE)
+    yield* Fiber.interrupt(fiber)
+  }),
 )
 
 it.instance("legacy prompt emits message events without session.next events", () =>

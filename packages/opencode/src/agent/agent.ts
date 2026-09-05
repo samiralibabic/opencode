@@ -10,7 +10,7 @@ import { Auth } from "../auth"
 import { ProviderTransform } from "@/provider/transform"
 
 import PROMPT_GENERATE from "./generate.txt"
-import PROMPT_COMPACTION from "./prompt/compaction.txt"
+import { SUMMARY_SYSTEM_PROMPT } from "@opencode-ai/core/session/compaction"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
@@ -221,7 +221,7 @@ const layer = Layer.effect(
             mode: "primary",
             native: true,
             hidden: true,
-            prompt: PROMPT_COMPACTION,
+            prompt: SUMMARY_SYSTEM_PROMPT,
             permission: Permission.merge(
               defaults,
               Permission.fromConfig({

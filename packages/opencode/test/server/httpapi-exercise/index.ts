@@ -1564,12 +1564,12 @@ const scenarios: Scenario[] = [
           "- Keep route local.",
           "- Test fixture: test/server/httpapi-exercise/index.ts.",
           "",
-          "## Work State",
+          "## Work State at Summary Cutoff",
           "- Completed: Summary generated.",
           "- Active: (none)",
           "- Blocked: (none)",
           "",
-          "## Next Move",
+          "## Next Move at Summary Cutoff",
           "1. (none)",
         ].join("\n")
         yield* ctx.llmText(summary)
