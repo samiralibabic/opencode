@@ -10,7 +10,7 @@ import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
-import { Effect, Exit, Schema, Scope } from "effect"
+import { Effect, Exit, Option, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
@@ -229,11 +229,21 @@ export const TaskTool = Tool.define(
         text: string,
       ) {
         const currentParent = yield* sessions.get(ctx.sessionID)
+        // Continue on the model of the user's last prompt; without one, the turn runs on the agent's configured model.
+        // Synthetic-only messages such as earlier results or reminders were not sent by the user.
+        const lastPrompt = yield* sessions
+          .findMessage(
+            ctx.sessionID,
+            (item) => item.info.role === "user" && item.parts.some((part) => part.type !== "text" || !part.synthetic),
+          )
+          .pipe(Effect.map(Option.getOrUndefined))
+        const selected = lastPrompt?.info.role === "user" ? lastPrompt.info.model : undefined
         yield* ops
           .prompt({
             sessionID: ctx.sessionID,
             agent: currentParent.agent ?? ctx.agent,
-            variant,
+            model: selected ? { providerID: selected.providerID, modelID: selected.modelID } : undefined,
+            variant: selected ? selected.variant : variant,
             parts: [
               {
                 type: "text",
