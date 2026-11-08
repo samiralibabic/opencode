@@ -749,6 +749,82 @@ describe("tool.task", () => {
     }),
   )
 
+  background.instance("background results continue on the model of the user's last prompt", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const selected = {
+        providerID: ProviderV2.ID.make("selected"),
+        modelID: ModelV2.ID.make("selected-model"),
+        variant: "high",
+      }
+      const prompted = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: selected,
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: prompted.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "look into the cache bug",
+      })
+      const earlier = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: earlier.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "earlier background result",
+        synthetic: true,
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) =>
+          input.sessionID === chat.id
+            ? Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
+            : Effect.succeed(reply(input, "background done")),
+      }
+
+      yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          background: true,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      const input = yield* Deferred.await(injected)
+      expect(input.model).toEqual({ providerID: selected.providerID, modelID: selected.modelID })
+      expect(input.variant).toBe("high")
+    }),
+  )
+
   background.instance("execute launches background tasks without waiting for completion", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
