@@ -1,21 +1,17 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect, Layer, Context, Schema, Scope } from "effect"
-import { formatPatch, structuredPatch } from "diff"
 import { InstanceState } from "@/effect/instance-state"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { Git } from "@/git"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { VcsEvent } from "@opencode-ai/schema/vcs-event"
+import { VcsPatch } from "@opencode-ai/core/vcs/patch"
 
 const PATCH_CONTEXT_LINES = 2_147_483_647
-const MAX_PATCH_BYTES = 10_000_000
-const MAX_TOTAL_PATCH_BYTES = 10_000_000
 type DiffOptions = {
   readonly context?: number
 }
-
-const emptyPatch = (file: string) => formatPatch(structuredPatch(file, file, "", "", "", "", { context: 0 }))
 
 const nums = (list: Git.Stat[]) =>
   new Map(list.map((item) => [item.file, { additions: item.additions, deletions: item.deletions }] as const))
@@ -105,7 +101,7 @@ const batchPatches = Effect.fnUntraced(function* (
 
   const result = yield* git.patchAll(cwd, ref, {
     context: options?.context ?? PATCH_CONTEXT_LINES,
-    maxOutputBytes: MAX_TOTAL_PATCH_BYTES,
+    maxOutputBytes: VcsPatch.MAX_TOTAL_PATCH_BYTES,
   })
 
   return {
@@ -130,21 +126,16 @@ const nativePatch = Effect.fnUntraced(function* (
     item.code === "??" || !ref
       ? yield* git.patchUntracked(cwd, item.file, {
           context: options?.context ?? PATCH_CONTEXT_LINES,
-          maxOutputBytes: MAX_PATCH_BYTES,
+          maxOutputBytes: VcsPatch.MAX_PATCH_BYTES,
         })
       : yield* git.patch(cwd, ref, item.file, {
           context: options?.context ?? PATCH_CONTEXT_LINES,
-          maxOutputBytes: MAX_PATCH_BYTES,
+          maxOutputBytes: VcsPatch.MAX_PATCH_BYTES,
         })
   if (!result.truncated && result.text) return result.text
 
-  return emptyPatch(item.file)
+  return VcsPatch.emptyPatch(item.file)
 })
-
-const totalPatch = (file: string, patch: string, total: number) => {
-  if (total + Buffer.byteLength(patch) <= MAX_TOTAL_PATCH_BYTES) return { patch, capped: false }
-  return { patch: emptyPatch(file), capped: true }
-}
 
 const patchForItem = Effect.fnUntraced(function* (
   git: Git.Interface,
@@ -155,11 +146,11 @@ const patchForItem = Effect.fnUntraced(function* (
   capped: boolean,
   options?: DiffOptions,
 ) {
-  if (capped) return emptyPatch(item.file)
+  if (capped) return VcsPatch.emptyPatch(item.file)
 
   const batched = batch.patches.get(item.file)
   if (batched !== undefined) return batched
-  if (item.code !== "??" && batch.capped) return emptyPatch(item.file)
+  if (item.code !== "??" && batch.capped) return VcsPatch.emptyPatch(item.file)
   return yield* nativePatch(git, cwd, ref, item, options)
 })
 
@@ -181,11 +172,11 @@ const files = Effect.fnUntraced(function* (
     const patch = yield* patchForItem(git, cwd, ref, item, batch, capped, options)
     const result: { patch: string; capped: boolean } = capped
       ? { patch, capped: true }
-      : totalPatch(item.file, patch, total)
+      : VcsPatch.totalPatch(item.file, patch, total)
     capped = capped || result.capped
     if (!capped) {
       total += Buffer.byteLength(result.patch)
-      capped = total >= MAX_TOTAL_PATCH_BYTES
+      capped = total >= VcsPatch.MAX_TOTAL_PATCH_BYTES
     }
     next.push({
       file: item.file,
