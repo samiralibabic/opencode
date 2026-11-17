@@ -10,6 +10,7 @@ import { Hash } from "@opencode-ai/core/util/hash"
 import { Config } from "@/config/config"
 import { Global } from "@opencode-ai/core/global"
 import { Info } from "@opencode-ai/schema/file-diff"
+import { VcsPatch } from "@opencode-ai/core/vcs/patch"
 
 export const Patch = Schema.Struct({
   hash: Schema.String,
@@ -681,6 +682,32 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                 ),
               )
 
+              // Blob sizes decide which files are loaded at all; a missing side counts as empty, an unknown one as too large.
+              const sizes = Effect.fnUntraced(function* (rows: Row[]) {
+                const refs = rows.flatMap((row) => (row.binary ? [] : [`${from}:${row.file}`, `${to}:${row.file}`]))
+                if (!refs.length) return new Map<string, number>()
+                const check = yield* git([...cfg, ...args(["cat-file", "--batch-check"])], {
+                  cwd: state.directory,
+                  stdin: refs.join("\n") + "\n",
+                })
+                if (check.code !== 0) {
+                  yield* Effect.logWarning("git cat-file --batch-check failed during snapshot diff, omitting patches", {
+                    stderr: check.stderr,
+                    refs: refs.length,
+                  })
+                  return new Map<string, number>()
+                }
+                const lines = check.text.split("\n")
+                return new Map(
+                  refs.flatMap((ref, index) => {
+                    const line = lines[index] ?? ""
+                    if (line.endsWith(" missing")) return [[ref, 0] as const]
+                    const size = line.match(/ (\d+)$/)?.[1]
+                    return size ? [[ref, Number(size)] as const] : []
+                  }),
+                )
+              })
+
               const result: FileDiff[] = []
               const status = new Map<string, "added" | "deleted" | "modified">()
 
@@ -732,20 +759,62 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                 rows.push(...filtered)
               }
 
+              // Like upstream, a file over the per-file cap and every file after the total cap get a header-only
+              // patch and keep their numstat counts. Blob sizes are checked first, so such files are never loaded
+              // or line-diffed, and each load reads at most 100 files and about the total cap of content.
               const step = 100
-              const patch = (file: string, before: string, after: string) =>
-                formatPatch(structuredPatch(file, file, before, after, "", "", { context: Number.MAX_SAFE_INTEGER }))
+              const size = yield* sizes(rows)
+              const blob = (ref: string) => size.get(ref) ?? Number.POSITIVE_INFINITY
+              const fits = (row: Row) =>
+                !row.binary &&
+                blob(`${from}:${row.file}`) <= VcsPatch.MAX_PATCH_BYTES &&
+                blob(`${to}:${row.file}`) <= VcsPatch.MAX_PATCH_BYTES
+              const weight = (row: Row) => (fits(row) ? blob(`${from}:${row.file}`) + blob(`${to}:${row.file}`) : 0)
+              const runs = rows.reduce<{ rows: Row[]; bytes: number }[]>((acc, row) => {
+                const last = acc.at(-1)
+                if (last && last.rows.length < step && last.bytes + weight(row) <= VcsPatch.MAX_TOTAL_PATCH_BYTES) {
+                  last.rows.push(row)
+                  last.bytes += weight(row)
+                  return acc
+                }
+                acc.push({ rows: [row], bytes: weight(row) })
+                return acc
+              }, [])
+              const full = Effect.fnUntraced(function* (
+                row: Row,
+                text: Map<string, { before: string; after: string }> | undefined,
+              ) {
+                const hit = text?.get(row.file) ?? { before: "", after: "" }
+                const [before, after] = text ? [hit.before, hit.after] : yield* show(row)
+                const patch = formatPatch(
+                  structuredPatch(row.file, row.file, before, after, "", "", { context: Number.MAX_SAFE_INTEGER }),
+                )
+                if (Buffer.byteLength(patch) > VcsPatch.MAX_PATCH_BYTES) return VcsPatch.emptyPatch(row.file)
+                return patch
+              })
+              let total = 0
+              let capped = false
 
-              for (let i = 0; i < rows.length; i += step) {
-                const run = rows.slice(i, i + step)
-                const text = yield* load(run)
+              for (const run of runs) {
+                const text = capped ? undefined : yield* load(run.rows.filter(fits))
 
-                for (const row of run) {
-                  const hit = text?.get(row.file) ?? { before: "", after: "" }
-                  const [before, after] = row.binary ? ["", ""] : text ? [hit.before, hit.after] : yield* show(row)
+                for (const row of run.rows) {
+                  const patch = row.binary
+                    ? ""
+                    : capped || !fits(row)
+                      ? VcsPatch.emptyPatch(row.file)
+                      : yield* full(row, text)
+                  const next: { patch: string; capped: boolean } = capped
+                    ? { patch, capped }
+                    : VcsPatch.totalPatch(row.file, patch, total)
+                  capped = next.capped
+                  if (!capped) {
+                    total += Buffer.byteLength(next.patch)
+                    capped = total >= VcsPatch.MAX_TOTAL_PATCH_BYTES
+                  }
                   result.push({
                     file: row.file,
-                    patch: row.binary ? "" : patch(row.file, before, after),
+                    patch: next.patch,
                     additions: row.additions,
                     deletions: row.deletions,
                     status: row.status,

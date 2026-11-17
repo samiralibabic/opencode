@@ -3,6 +3,8 @@ import { $ } from "bun"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { AppProcess } from "@opencode-ai/core/process"
+import { VcsPatch } from "@opencode-ai/core/vcs/patch"
 import fs from "fs/promises"
 import path from "path"
 import { Effect, Fiber, Layer } from "effect"
@@ -18,6 +20,31 @@ import { testEffect } from "../lib/effect"
 
 const it = testEffect(
   Layer.mergeAll(LayerNode.compile(LayerNode.group([Snapshot.node, FSUtil.node])), testInstanceStoreLayer),
+)
+// Records the stdout size of every process the snapshot service runs, to show which file contents it loads.
+const processOutputs: number[] = []
+const recordedIt = testEffect(
+  Layer.mergeAll(
+    LayerNode.compile(LayerNode.group([Snapshot.node, FSUtil.node]), [
+      [
+        AppProcess.node,
+        Layer.effect(
+          AppProcess.Service,
+          Effect.gen(function* () {
+            const appProcess = yield* AppProcess.Service
+            return AppProcess.Service.of({
+              ...appProcess,
+              run: (command, options) =>
+                appProcess
+                  .run(command, options)
+                  .pipe(Effect.tap((result) => Effect.sync(() => processOutputs.push(result.stdout.length)))),
+            })
+          }),
+        ).pipe(Layer.provide(LayerNode.compile(AppProcess.node))),
+      ],
+    ]),
+    testInstanceStoreLayer,
+  ),
 )
 // Windows forbids both * and : in directory names.
 const nonWindowsIt = process.platform === "win32" ? it.live.skip : it.live
@@ -1134,6 +1161,93 @@ it.instance(
     expect(diffs.length).toBe(1)
     expect(diffs[0].file).toBe("whitespace.txt")
     expect(diffs[0].additions).toBeGreaterThan(0)
+  }),
+  { git: true },
+)
+
+// Generated data file with one JSON object per line, like the data files agents regenerate.
+const generatedLines = (bytes: number) =>
+  Array.from({ length: Math.ceil(bytes / 80) }, (_, id) => `{"id":${id},"name":"vet-${id}","note":"${"x".repeat(40)}"}`)
+
+recordedIt.instance(
+  "diffFull gives files over the patch cap an empty patch with counts without loading them",
+  Effect.gen(function* () {
+    const tmp = yield* TestInstance
+    const snapshot = yield* Snapshot.Service
+    const lines = generatedLines(VcsPatch.MAX_PATCH_BYTES + 1_000_000)
+    yield* write(`${tmp.directory}/big.json`, lines.join("\n") + "\n")
+    yield* write(`${tmp.directory}/gone.json`, lines.join("\n") + "\n")
+    yield* write(`${tmp.directory}/small.txt`, "old\n")
+    // Files over the untracked size limit only enter snapshots when the project tracks them.
+    yield* exec(tmp.directory, ["git", "add", "."])
+    yield* exec(tmp.directory, ["git", "commit", "-m", "data"])
+    const before = yield* snapshot.track()
+    expect(before).toBeTruthy()
+    const regenerated = lines
+      .slice(0, -2)
+      .map((line, index) => ([10, 1000, 100_000].includes(index) ? `${line} ` : line))
+    yield* write(`${tmp.directory}/big.json`, regenerated.join("\n") + "\n")
+    yield* rm(`${tmp.directory}/gone.json`)
+    yield* write(`${tmp.directory}/small.txt`, "new\n")
+    const after = yield* snapshot.track()
+    expect(after).toBeTruthy()
+
+    processOutputs.length = 0
+    const diffs = yield* snapshot.diffFull(before!, after!)
+
+    expect(diffs.map((item) => [item.file, item.status, item.additions, item.deletions])).toEqual([
+      ["big.json", "modified", 3, 5],
+      ["gone.json", "deleted", 0, lines.length],
+      ["small.txt", "modified", 1, 1],
+    ])
+    expect(diffs[0].patch).toBe(VcsPatch.emptyPatch("big.json"))
+    expect(diffs[1].patch).toBe(VcsPatch.emptyPatch("gone.json"))
+    expect(diffs[2].patch).toContain("-old")
+    expect(diffs[2].patch).toContain("+new")
+    expect(Math.max(...processOutputs)).toBeLessThan(1024 * 1024)
+  }),
+  { git: true },
+)
+
+recordedIt.instance(
+  "diffFull stops storing patches once their total reaches the cap",
+  Effect.gen(function* () {
+    const tmp = yield* TestInstance
+    const snapshot = yield* Snapshot.Service
+    // Each full-file patch fits the per-file cap; the first two together fill most of the total cap.
+    const lines = generatedLines(VcsPatch.MAX_TOTAL_PATCH_BYTES * 0.4)
+    const parts = ["part-1.json", "part-2.json", "part-3.json"]
+    yield* Effect.all(parts.map((file) => write(`${tmp.directory}/${file}`, lines.join("\n") + "\n")))
+    yield* write(`${tmp.directory}/small.txt`, "old\n")
+    yield* exec(tmp.directory, ["git", "add", "."])
+    yield* exec(tmp.directory, ["git", "commit", "-m", "data"])
+    const before = yield* snapshot.track()
+    expect(before).toBeTruthy()
+    yield* Effect.all(
+      parts.map((file) => write(`${tmp.directory}/${file}`, ["changed", ...lines.slice(1)].join("\n") + "\n")),
+    )
+    yield* write(`${tmp.directory}/small.txt`, "new\n")
+    const after = yield* snapshot.track()
+    expect(after).toBeTruthy()
+
+    processOutputs.length = 0
+    const diffs = yield* snapshot.diffFull(before!, after!)
+
+    expect(diffs.map((item) => [item.file, item.status, item.additions, item.deletions])).toEqual([
+      ["part-1.json", "modified", 1, 1],
+      ["part-2.json", "modified", 1, 1],
+      ["part-3.json", "modified", 1, 1],
+      ["small.txt", "modified", 1, 1],
+    ])
+    expect(diffs[0].patch).toContain("+changed")
+    expect(diffs[1].patch).toContain("+changed")
+    expect(diffs[2].patch).toBe(VcsPatch.emptyPatch("part-3.json"))
+    expect(diffs[3].patch).toBe(VcsPatch.emptyPatch("small.txt"))
+    expect(diffs.reduce((total, item) => total + Buffer.byteLength(item.patch ?? ""), 0)).toBeLessThanOrEqual(
+      VcsPatch.MAX_TOTAL_PATCH_BYTES,
+    )
+    // No single load reads more than the total cap of file content (plus git's object headers).
+    expect(Math.max(...processOutputs)).toBeLessThanOrEqual(VcsPatch.MAX_TOTAL_PATCH_BYTES + 1024)
   }),
   { git: true },
 )
