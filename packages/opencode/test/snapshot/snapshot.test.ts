@@ -4,7 +4,6 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { AppProcess } from "@opencode-ai/core/process"
-import { VcsPatch } from "@opencode-ai/core/vcs/patch"
 import fs from "fs/promises"
 import path from "path"
 import { Effect, Fiber, Layer } from "effect"
@@ -46,6 +45,43 @@ const recordedIt = testEffect(
     testInstanceStoreLayer,
   ),
 )
+const PATCH_CAP_BYTES = 10_000_000
+const emptyPatch = (file: string) =>
+  "Index: " + file + "\n===================================================================\n--- " + file + "\t\n+++ " + file + "\t\n"
+
+const withBatchCheck = (sizes?: number[]) =>
+  testEffect(
+    Layer.mergeAll(
+      LayerNode.compile(LayerNode.group([Snapshot.node, FSUtil.node]), [
+        [
+          AppProcess.node,
+          Layer.effect(
+            AppProcess.Service,
+            Effect.gen(function* () {
+              const appProcess = yield* AppProcess.Service
+              return AppProcess.Service.of({
+                ...appProcess,
+                run: (command, options) =>
+                  appProcess.run(command, options).pipe(
+                    Effect.map((result) => {
+                      if (command._tag !== "StandardCommand" || !command.args.includes("--batch-check")) return result
+                      const output = sizes?.map((size) => "0000000000000000000000000000000000000000 blob " + size).join("\n")
+                      return { ...result, stdout: Buffer.from(output ? output + "\n" : "") }
+                    }),
+                  ),
+              })
+            }),
+          ).pipe(Layer.provide(LayerNode.compile(AppProcess.node))),
+        ],
+      ]),
+      testInstanceStoreLayer,
+    ),
+  )
+
+const oversizedIt = withBatchCheck([PATCH_CAP_BYTES + 1, PATCH_CAP_BYTES + 1])
+const mixedIt = withBatchCheck([PATCH_CAP_BYTES + 1, PATCH_CAP_BYTES + 1, 0, 0])
+const malformedIt = withBatchCheck()
+
 // Windows forbids both * and : in directory names.
 const nonWindowsIt = process.platform === "win32" ? it.live.skip : it.live
 
@@ -1165,46 +1201,103 @@ it.instance(
   { git: true },
 )
 
+oversizedIt.instance(
+  "diffFull gives an added file over the patch cap a header-only patch",
+  Effect.gen(function* () {
+    const tmp = yield* TestInstance
+    const snapshot = yield* Snapshot.Service
+    const before = yield* snapshot.track()
+    expect(before).toBeTruthy()
+    yield* write(tmp.directory + "/added.txt", "added\n")
+    const after = yield* snapshot.track()
+    expect(after).toBeTruthy()
+
+    const [diff] = yield* snapshot.diffFull(before!, after!)
+    expect(diff.file).toBe("added.txt")
+    expect(diff.status).toBe("added")
+    expect(diff.patch).toBe(emptyPatch("added.txt"))
+  }),
+  { git: true },
+)
+
+mixedIt.instance(
+  "diffFull keeps a small patch after a per-file-capped row",
+  Effect.gen(function* () {
+    const tmp = yield* TestInstance
+    const snapshot = yield* Snapshot.Service
+    const before = yield* snapshot.track()
+    expect(before).toBeTruthy()
+    yield* write(tmp.directory + "/capped.txt", "capped\n")
+    yield* write(tmp.directory + "/small.txt", "small\n")
+    const after = yield* snapshot.track()
+    expect(after).toBeTruthy()
+
+    const diffs = yield* snapshot.diffFull(before!, after!)
+    expect(diffs.find((diff) => diff.file === "capped.txt")?.patch).toBe(emptyPatch("capped.txt"))
+    expect(diffs.find((diff) => diff.file === "small.txt")?.patch).toContain("+small")
+  }),
+  { git: true },
+)
+
+oversizedIt.instance(
+  "diffFull keeps binary rows empty while capping text rows",
+  Effect.gen(function* () {
+    const tmp = yield* TestInstance
+    const snapshot = yield* Snapshot.Service
+    const before = yield* snapshot.track()
+    expect(before).toBeTruthy()
+    yield* write(tmp.directory + "/binary.bin", new Uint8Array([0x00, 0x01, 0x02, 0x03]))
+    yield* write(tmp.directory + "/capped.txt", "capped\n")
+    const after = yield* snapshot.track()
+    expect(after).toBeTruthy()
+
+    const diffs = yield* snapshot.diffFull(before!, after!)
+    expect(diffs.find((diff) => diff.file === "binary.bin")?.patch).toBe("")
+    expect(diffs.find((diff) => diff.file === "capped.txt")?.patch).toBe(emptyPatch("capped.txt"))
+  }),
+  { git: true },
+)
+
+malformedIt.instance(
+  "diffFull omits all patches after malformed cat-file preflight output",
+  Effect.gen(function* () {
+    const tmp = yield* TestInstance
+    const snapshot = yield* Snapshot.Service
+    const before = yield* snapshot.track()
+    expect(before).toBeTruthy()
+    yield* write(tmp.directory + "/malformed.txt", "malformed\n")
+    const after = yield* snapshot.track()
+    expect(after).toBeTruthy()
+
+    const [diff] = yield* snapshot.diffFull(before!, after!)
+    expect(diff.patch).toBe(emptyPatch("malformed.txt"))
+  }),
+  { git: true },
+)
+
 // Generated data file with one JSON object per line, like the data files agents regenerate.
 const generatedLines = (bytes: number) =>
   Array.from({ length: Math.ceil(bytes / 80) }, (_, id) => `{"id":${id},"name":"vet-${id}","note":"${"x".repeat(40)}"}`)
 
 recordedIt.instance(
-  "diffFull gives files over the patch cap an empty patch with counts without loading them",
+  "diffFull gives a file at the blob cap a header-only patch when formatting exceeds it",
   Effect.gen(function* () {
     const tmp = yield* TestInstance
     const snapshot = yield* Snapshot.Service
-    const lines = generatedLines(VcsPatch.MAX_PATCH_BYTES + 1_000_000)
-    yield* write(`${tmp.directory}/big.json`, lines.join("\n") + "\n")
-    yield* write(`${tmp.directory}/gone.json`, lines.join("\n") + "\n")
-    yield* write(`${tmp.directory}/small.txt`, "old\n")
+    yield* write(tmp.directory + "/boundary.txt", "x".repeat(PATCH_CAP_BYTES))
     // Files over the untracked size limit only enter snapshots when the project tracks them.
     yield* exec(tmp.directory, ["git", "add", "."])
     yield* exec(tmp.directory, ["git", "commit", "-m", "data"])
     const before = yield* snapshot.track()
     expect(before).toBeTruthy()
-    const regenerated = lines
-      .slice(0, -2)
-      .map((line, index) => ([10, 1000, 100_000].includes(index) ? `${line} ` : line))
-    yield* write(`${tmp.directory}/big.json`, regenerated.join("\n") + "\n")
-    yield* rm(`${tmp.directory}/gone.json`)
-    yield* write(`${tmp.directory}/small.txt`, "new\n")
+    yield* rm(tmp.directory + "/boundary.txt")
     const after = yield* snapshot.track()
     expect(after).toBeTruthy()
 
-    processOutputs.length = 0
-    const diffs = yield* snapshot.diffFull(before!, after!)
-
-    expect(diffs.map((item) => [item.file, item.status, item.additions, item.deletions])).toEqual([
-      ["big.json", "modified", 3, 5],
-      ["gone.json", "deleted", 0, lines.length],
-      ["small.txt", "modified", 1, 1],
-    ])
-    expect(diffs[0].patch).toBe(VcsPatch.emptyPatch("big.json"))
-    expect(diffs[1].patch).toBe(VcsPatch.emptyPatch("gone.json"))
-    expect(diffs[2].patch).toContain("-old")
-    expect(diffs[2].patch).toContain("+new")
-    expect(Math.max(...processOutputs)).toBeLessThan(1024 * 1024)
+    const [diff] = yield* snapshot.diffFull(before!, after!)
+    expect(diff.file).toBe("boundary.txt")
+    expect(diff.status).toBe("deleted")
+    expect(diff.patch).toBe(emptyPatch("boundary.txt"))
   }),
   { git: true },
 )
@@ -1215,7 +1308,7 @@ recordedIt.instance(
     const tmp = yield* TestInstance
     const snapshot = yield* Snapshot.Service
     // Each full-file patch fits the per-file cap; the first two together fill most of the total cap.
-    const lines = generatedLines(VcsPatch.MAX_TOTAL_PATCH_BYTES * 0.4)
+    const lines = generatedLines(PATCH_CAP_BYTES * 0.34)
     const parts = ["part-1.json", "part-2.json", "part-3.json"]
     yield* Effect.all(parts.map((file) => write(`${tmp.directory}/${file}`, lines.join("\n") + "\n")))
     yield* write(`${tmp.directory}/small.txt`, "old\n")
@@ -1241,13 +1334,13 @@ recordedIt.instance(
     ])
     expect(diffs[0].patch).toContain("+changed")
     expect(diffs[1].patch).toContain("+changed")
-    expect(diffs[2].patch).toBe(VcsPatch.emptyPatch("part-3.json"))
-    expect(diffs[3].patch).toBe(VcsPatch.emptyPatch("small.txt"))
+    expect(diffs[2].patch).toBe(emptyPatch("part-3.json"))
+    expect(diffs[3].patch).toBe(emptyPatch("small.txt"))
     expect(diffs.reduce((total, item) => total + Buffer.byteLength(item.patch ?? ""), 0)).toBeLessThanOrEqual(
-      VcsPatch.MAX_TOTAL_PATCH_BYTES,
+      PATCH_CAP_BYTES,
     )
     // No single load reads more than the total cap of file content (plus git's object headers).
-    expect(Math.max(...processOutputs)).toBeLessThanOrEqual(VcsPatch.MAX_TOTAL_PATCH_BYTES + 1024)
+    expect(Math.max(...processOutputs)).toBeLessThanOrEqual(PATCH_CAP_BYTES + 1024)
   }),
   { git: true },
 )

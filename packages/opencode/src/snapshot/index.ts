@@ -697,15 +697,19 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                   })
                   return new Map<string, number>()
                 }
-                const lines = check.text.split("\n")
-                return new Map(
-                  refs.flatMap((ref, index) => {
-                    const line = lines[index] ?? ""
-                    if (line.endsWith(" missing")) return [[ref, 0] as const]
-                    const size = line.match(/ (\d+)$/)?.[1]
-                    return size ? [[ref, Number(size)] as const] : []
-                  }),
-                )
+                const lines = check.text.endsWith("\n") ? check.text.slice(0, -1).split("\n") : check.text.split("\n")
+                const parsed = lines.map((line, index) => {
+                  if (line === refs[index] + " missing") return 0
+                  const size = Number(line.match(/^[0-9a-f]+ blob (\d+)$/)?.[1])
+                  return Number.isFinite(size) && size >= 0 ? size : undefined
+                })
+                if (lines.length !== refs.length || parsed.some((size) => size === undefined)) {
+                  yield* Effect.logWarning("git cat-file --batch-check returned malformed output during snapshot diff, omitting patches", {
+                    refs: refs.length,
+                  })
+                  return new Map<string, number>()
+                }
+                return new Map(refs.map((ref, index) => [ref, parsed[index]!] as const))
               })
 
               const result: FileDiff[] = []
@@ -760,8 +764,8 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
               }
 
               // Like upstream, a file over the per-file cap and every file after the total cap get a header-only
-              // patch and keep their numstat counts. Blob sizes are checked first, so such files are never loaded
-              // or line-diffed, and each load reads at most 100 files and about the total cap of content.
+              // patch and keep their numstat counts. Each side is gated at 10 MB; full-context structuredPatch
+              // still runs on files under the cap.
               const step = 100
               const size = yield* sizes(rows)
               const blob = (ref: string) => size.get(ref) ?? Number.POSITIVE_INFINITY
