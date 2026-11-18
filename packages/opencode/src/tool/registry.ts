@@ -97,6 +97,7 @@ const layer = Layer.effect(
     const truncate = yield* Truncate.Service
     const flags = yield* RuntimeFlags.Service
     const mcp = yield* MCP.Service
+    const lsp = yield* LSP.Service
 
     const invalid = yield* InvalidTool
     const task = yield* TaskTool
@@ -148,6 +149,14 @@ const layer = Layer.effect(
                 const pluginCtx: PluginToolContext = {
                   ...toolCtx,
                   ask: (req) => bridge.promise(toolCtx.ask(req)),
+                  diagnostics: (file) =>
+                    bridge.promise(
+                      Effect.gen(function* () {
+                        yield* lsp.touchFile(file, "document")
+                        const diagnostics = yield* lsp.diagnostics()
+                        return LSP.Diagnostic.report(file, diagnostics[FSUtil.normalizePath(file)] ?? []) || undefined
+                      }),
+                    ),
                   directory: ctx.directory,
                   worktree: ctx.worktree,
                 }
