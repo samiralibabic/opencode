@@ -15,6 +15,8 @@ export type ToolContext = {
    */
   worktree: string
   abort: AbortSignal
+  /** Formatted document diagnostics after the host touches this file. Optional for compatibility with older hosts. */
+  diagnostics?: (file: string) => Promise<string | undefined>
   metadata(input: { title?: string; metadata?: { [key: string]: any } }): void
   ask(input: AskInput): Promise<void>
 }

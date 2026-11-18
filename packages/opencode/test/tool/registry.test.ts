@@ -17,6 +17,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { ToolJsonSchema } from "@/tool/json-schema"
 import { MessageID, SessionID } from "@/session/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { LSP } from "@/lsp/lsp"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { MCP } from "@/mcp"
@@ -567,6 +568,88 @@ describe("tool.registry", () => {
       const registry = yield* ToolRegistry.Service
       const ids = yield* registry.ids()
       expect(ids).toContain("cowsay")
+    }),
+  )
+})
+
+const diagnosticFile = "/tmp/plugin-diagnostics.ts"
+let diagnosticTouches: Array<{ file: string; mode: string | undefined }> = []
+const diagnosticLspLayer = Layer.succeed(
+  LSP.Service,
+  LSP.Service.of({
+    init: () => Effect.void,
+    status: () => Effect.succeed([]),
+    hasClients: () => Effect.succeed(true),
+    touchFile: (file, mode) =>
+      Effect.sync(() => {
+        diagnosticTouches.push({ file, mode })
+      }),
+    diagnostics: () =>
+      Effect.succeed({
+        [diagnosticFile]: [
+          {
+            range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+            severity: 1,
+            message: "style/noRestrictedImports: packages/rules holds pure rules",
+          },
+        ],
+      }),
+    hover: () => Effect.succeed([]),
+    definition: () => Effect.succeed([]),
+    references: () => Effect.succeed([]),
+    implementation: () => Effect.succeed([]),
+    documentSymbol: () => Effect.succeed([]),
+    workspaceSymbol: () => Effect.succeed([]),
+    prepareCallHierarchy: () => Effect.succeed([]),
+    incomingCalls: () => Effect.succeed([]),
+    outgoingCalls: () => Effect.succeed([]),
+  }),
+)
+const diagnosticsPluginLayer = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    init: () => Effect.void,
+    trigger: ((_name: unknown, _input: unknown, output: unknown) => Effect.succeed(output)) as Plugin.Interface["trigger"],
+    list: () =>
+      Effect.succeed([
+        {
+          tool: {
+            diagnostics_probe: {
+              description: "exposes LSP diagnostics to plugins",
+              args: {},
+              execute: async (_args, context) => (await context.diagnostics!(diagnosticFile)) ?? "no diagnostics",
+            },
+          },
+        },
+      ]),
+  }),
+)
+const withPluginDiagnostics = testEffect(
+  LayerNode.compile(root, [...replacements, [Plugin.node, diagnosticsPluginLayer], [LSP.node, diagnosticLspLayer]]),
+)
+
+describe("plugin diagnostics context", () => {
+  withPluginDiagnostics.instance("renders the same document diagnostics available to built-in edit tools", () =>
+    Effect.gen(function* () {
+      diagnosticTouches = []
+      const registry = yield* ToolRegistry.Service
+      const loaded = (yield* registry.all()).find((tool) => tool.id === "diagnostics_probe")
+      if (!loaded) throw new Error("diagnostics probe was not loaded")
+      const agents = yield* Agent.Service
+      const result = yield* loaded.execute({}, {
+        sessionID: SessionID.make("ses_test"),
+        messageID: MessageID.make("msg_test"),
+        agent: (yield* agents.defaultInfo()).name,
+        abort: new AbortController().signal,
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      } satisfies Tool.Context)
+
+      expect(result.output).toBe(
+        `<diagnostics file="${diagnosticFile}">\nERROR [1:1] style/noRestrictedImports: packages/rules holds pure rules\n</diagnostics>`,
+      )
+      expect(diagnosticTouches).toEqual([{ file: diagnosticFile, mode: "document" }])
     }),
   )
 })
