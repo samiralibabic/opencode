@@ -4,6 +4,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -57,6 +58,7 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
 
 const it = testEffect(layer())
 const background = testEffect(layer({ experimentalBackgroundSubagents: true }))
+const batchedBackground = testEffect(layer({ experimentalBackgroundSubagents: true, backgroundResultBatchMs: 60_000 }))
 
 function defer<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -110,6 +112,42 @@ function stubOps(opts?: {
         opts?.onPrompt?.(input)
         return reply(input, opts?.text ?? "done", opts?.error, opts?.toolError)
       }),
+  }
+}
+
+function batchingPromptOps(
+  parentSessionID: SessionID,
+  completions: ReadonlyMap<string, Deferred.Deferred<void>>,
+  parentPrompts: SessionPrompt.PromptInput[],
+): TaskPromptOps {
+  return {
+    cancel: () => Effect.void,
+    resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+    prompt: (input) => {
+      if (input.sessionID === parentSessionID)
+        return Effect.sync(() => {
+          parentPrompts.push(input)
+          return reply(input, "injected")
+        })
+      const part = input.parts.find((item) => item.type === "text")
+      if (!part || part.type !== "text") return Effect.die(new Error("unexpected background task prompt"))
+      const completion = completions.get(part.text)
+      if (!completion) return Effect.die(new Error("unexpected background task prompt"))
+      return Deferred.await(completion).pipe(Effect.as(reply(input, part.text + " done")))
+    },
+  }
+}
+
+function taskContext(chat: { id: SessionID }, assistant: SessionV1.Assistant, promptOps: TaskPromptOps) {
+  return {
+    sessionID: chat.id,
+    messageID: assistant.id,
+    agent: "build",
+    abort: new AbortController().signal,
+    extra: { promptOps },
+    messages: [],
+    metadata: () => Effect.void,
+    ask: () => Effect.void,
   }
 }
 
@@ -746,6 +784,211 @@ describe("tool.task", () => {
       expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.output).toBe("background done")
       expect((yield* Deferred.await(injected)).parts[0]?.type).toBe("text")
       expect(runs).toBe(1)
+    }),
+  )
+
+  background.instance("background result batching remains immediate when the setting is unset", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const first = yield* Deferred.make<void>()
+      const second = yield* Deferred.make<void>()
+      const third = yield* Deferred.make<void>()
+      const parentPrompts: SessionPrompt.PromptInput[] = []
+      const promptOps = batchingPromptOps(
+        chat.id,
+        new Map([
+          ["first", first],
+          ["second", second],
+          ["third", third],
+        ]),
+        parentPrompts,
+      )
+      const context = taskContext(chat, assistant, promptOps)
+      const launch = (prompt: string) =>
+        def.execute({ description: prompt + " helper", prompt, subagent_type: "general", background: true }, context)
+
+      yield* launch("first")
+      yield* launch("second")
+      yield* launch("third")
+      yield* Deferred.succeed(first, undefined)
+      yield* Effect.yieldNow
+      expect(parentPrompts).toHaveLength(1)
+      yield* Deferred.succeed(second, undefined)
+      yield* Effect.yieldNow
+      expect(parentPrompts).toHaveLength(2)
+      yield* Deferred.succeed(third, undefined)
+      yield* Effect.yieldNow
+      expect(parentPrompts).toHaveLength(3)
+    }),
+  )
+
+  batchedBackground.instance("background result batching combines results while siblings are running", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const first = yield* Deferred.make<void>()
+      const second = yield* Deferred.make<void>()
+      const third = yield* Deferred.make<void>()
+      const parentPrompts: SessionPrompt.PromptInput[] = []
+      const promptOps = batchingPromptOps(
+        chat.id,
+        new Map([
+          ["first", first],
+          ["second", second],
+          ["third", third],
+        ]),
+        parentPrompts,
+      )
+      const context = taskContext(chat, assistant, promptOps)
+      const launch = (prompt: string) =>
+        def.execute({ description: prompt + " helper", prompt, subagent_type: "general", background: true }, context)
+
+      yield* launch("first")
+      yield* launch("second")
+      yield* launch("third")
+      yield* Deferred.succeed(first, undefined)
+      yield* Effect.yieldNow
+      yield* Deferred.succeed(second, undefined)
+      yield* Effect.yieldNow
+      expect(parentPrompts).toHaveLength(0)
+      yield* Deferred.succeed(third, undefined)
+      yield* Effect.yieldNow
+      expect(parentPrompts).toHaveLength(1)
+      const parts = parentPrompts[0]?.parts
+      expect(parts).toHaveLength(3)
+      expect(parts?.map((part) => (part.type === "text" ? part.text : ""))).toEqual([
+        expect.stringContaining("first done"),
+        expect.stringContaining("second done"),
+        expect.stringContaining("third done"),
+      ])
+      expect(parts?.every((part) => part.type === "text" && part.synthetic)).toBe(true)
+    }),
+  )
+
+  batchedBackground.instance("background result batching sends a lone result immediately", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const done = yield* Deferred.make<void>()
+      const parentPrompts: SessionPrompt.PromptInput[] = []
+      const promptOps = batchingPromptOps(chat.id, new Map([["only", done]]), parentPrompts)
+
+      yield* def.execute(
+        { description: "only helper", prompt: "only", subagent_type: "general", background: true },
+        taskContext(chat, assistant, promptOps),
+      )
+      yield* Deferred.succeed(done, undefined)
+      yield* Effect.yieldNow
+      expect(parentPrompts).toHaveLength(1)
+      expect(parentPrompts[0]?.parts).toHaveLength(1)
+    }),
+  )
+
+  batchedBackground.instance("background result batching caps a fixed wait window", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const first = yield* Deferred.make<void>()
+      const second = yield* Deferred.make<void>()
+      const parentPrompts: SessionPrompt.PromptInput[] = []
+      const promptOps = batchingPromptOps(
+        chat.id,
+        new Map([
+          ["first", first],
+          ["second", second],
+        ]),
+        parentPrompts,
+      )
+      const context = taskContext(chat, assistant, promptOps)
+      const launch = (prompt: string) =>
+        def.execute({ description: prompt + " helper", prompt, subagent_type: "general", background: true }, context)
+
+      yield* launch("first")
+      yield* launch("second")
+      yield* Deferred.succeed(first, undefined)
+      yield* Effect.yieldNow
+      expect(parentPrompts).toHaveLength(0)
+      yield* TestClock.adjust(70_000)
+      yield* Effect.yieldNow
+      expect(parentPrompts).toHaveLength(1)
+      yield* Deferred.succeed(second, undefined)
+      yield* Effect.yieldNow
+      expect(parentPrompts).toHaveLength(2)
+    }).pipe(Effect.provide(TestClock.layer())),
+  )
+
+  batchedBackground.instance("batched background results use the user's selected model and variant", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const selected = {
+        providerID: ProviderV2.ID.make("selected"),
+        modelID: ModelV2.ID.make("selected-model"),
+        variant: "high",
+      }
+      const prompted = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: selected,
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: prompted.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "use the selected model",
+      })
+      const synthetic = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: synthetic.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "earlier background result",
+        synthetic: true,
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const first = yield* Deferred.make<void>()
+      const second = yield* Deferred.make<void>()
+      const parentPrompts: SessionPrompt.PromptInput[] = []
+      const promptOps = batchingPromptOps(
+        chat.id,
+        new Map([
+          ["first", first],
+          ["second", second],
+        ]),
+        parentPrompts,
+      )
+      const context = taskContext(chat, assistant, promptOps)
+      const launch = (prompt: string) =>
+        def.execute({ description: prompt + " helper", prompt, subagent_type: "general", background: true }, context)
+
+      yield* launch("first")
+      yield* launch("second")
+      yield* Deferred.succeed(first, undefined)
+      yield* Effect.yieldNow
+      yield* Deferred.succeed(second, undefined)
+      yield* Effect.yieldNow
+      expect(parentPrompts).toHaveLength(1)
+      expect(parentPrompts[0]?.model).toEqual({ providerID: selected.providerID, modelID: selected.modelID })
+      expect(parentPrompts[0]?.variant).toBe("high")
+      expect(parentPrompts[0]?.parts).toHaveLength(2)
     }),
   )
 
