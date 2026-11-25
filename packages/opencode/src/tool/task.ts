@@ -78,6 +78,22 @@ function renderOutput(input: {
   ].join("\n")
 }
 
+type BackgroundResult = {
+  parentSessionID: SessionID
+  sessionID: SessionID
+  state: "completed" | "error"
+  summary: string
+  text: string
+  agent: string
+  variant?: string
+  ops: TaskPromptOps
+}
+
+type BackgroundResultBatch = {
+  token: object
+  results: BackgroundResult[]
+}
+
 export const TaskTool = Tool.define(
   id,
   Effect.gen(function* () {
@@ -88,6 +104,108 @@ export const TaskTool = Tool.define(
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const batches = new Map<SessionID, BackgroundResultBatch>()
+
+    const promptResults = Effect.fn("TaskTool.promptBackgroundResults")(function* (
+      results: readonly BackgroundResult[],
+    ) {
+      const source = results[0]
+      if (!source) return
+      const currentParent = yield* sessions.get(source.parentSessionID)
+      // Continue on the model of the user's last prompt; without one, the turn runs on the agent's configured model.
+      // Synthetic-only messages such as earlier results or reminders were not sent by the user.
+      const lastPrompt = yield* sessions
+        .findMessage(
+          source.parentSessionID,
+          (item) => item.info.role === "user" && item.parts.some((part) => part.type !== "text" || !part.synthetic),
+        )
+        .pipe(Effect.map(Option.getOrUndefined))
+      const selected = lastPrompt?.info.role === "user" ? lastPrompt.info.model : undefined
+      yield* source.ops
+        .prompt({
+          sessionID: source.parentSessionID,
+          agent: currentParent.agent ?? source.agent,
+          model: selected ? { providerID: selected.providerID, modelID: selected.modelID } : undefined,
+          variant: selected ? selected.variant : source.variant,
+          parts: results.map((result) => ({
+            type: "text" as const,
+            synthetic: true,
+            text: renderOutput({
+              sessionID: result.sessionID,
+              state: result.state,
+              summary: result.summary,
+              text: result.text,
+            }),
+          })),
+        })
+        .pipe(Effect.ignore)
+    })
+
+    const flush = Effect.fn("TaskTool.flushBackgroundResults")(function* (parentSessionID: SessionID, token?: object) {
+      const batch = batches.get(parentSessionID)
+      if (!batch || (token && batch.token !== token)) return
+      batches.delete(parentSessionID)
+      yield* promptResults(batch.results)
+    })
+
+    const hasRunningBackgroundTask = (parentSessionID: SessionID, except?: SessionID) =>
+      background
+        .list()
+        .pipe(
+          Effect.map((jobs) =>
+            jobs.some(
+              (job) =>
+                job.id !== except &&
+                job.status === "running" &&
+                job.metadata?.background === true &&
+                job.metadata?.parentSessionId === parentSessionID,
+            ),
+          ),
+        )
+
+    const flushWhenParentIsIdle = Effect.fn("TaskTool.flushBackgroundResultsWhenParentIsIdle")(function* (
+      parentSessionID: SessionID,
+    ) {
+      if (!batches.has(parentSessionID)) return
+      if (yield* hasRunningBackgroundTask(parentSessionID)) return
+      yield* flush(parentSessionID).pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
+    })
+
+    const enqueueBackgroundResult = Effect.fn("TaskTool.enqueueBackgroundResult")(function* (
+      result: BackgroundResult,
+      batchMs: number,
+    ) {
+      const hasOtherRunningTask = yield* hasRunningBackgroundTask(result.parentSessionID, result.sessionID)
+      const current = batches.get(result.parentSessionID)
+      if (!current && !hasOtherRunningTask) {
+        yield* promptResults([result]).pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
+        return
+      }
+      if (current) {
+        current.results.push(result)
+        if (!hasOtherRunningTask)
+          yield* flush(result.parentSessionID, current.token).pipe(
+            Effect.ignore,
+            Effect.forkIn(scope, { startImmediately: true }),
+          )
+        return
+      }
+      const batch = { token: {}, results: [result] }
+      batches.set(result.parentSessionID, batch)
+      yield* Effect.sleep(batchMs).pipe(
+        Effect.andThen(flush(result.parentSessionID, batch.token)),
+        Effect.ignore,
+        Effect.forkIn(scope, { startImmediately: true }),
+      )
+    })
+
+    yield* Effect.addFinalizer(() =>
+      Effect.forEach(
+        Array.from(batches.entries()),
+        ([parentSessionID, batch]) => flush(parentSessionID, batch.token).pipe(Effect.ignore),
+        { discard: true },
+      ),
+    )
 
     const run = Effect.fn("TaskTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
@@ -228,39 +346,25 @@ export const TaskTool = Tool.define(
         state: "completed" | "error",
         text: string,
       ) {
-        const currentParent = yield* sessions.get(ctx.sessionID)
-        // Continue on the model of the user's last prompt; without one, the turn runs on the agent's configured model.
-        // Synthetic-only messages such as earlier results or reminders were not sent by the user.
-        const lastPrompt = yield* sessions
-          .findMessage(
-            ctx.sessionID,
-            (item) => item.info.role === "user" && item.parts.some((part) => part.type !== "text" || !part.synthetic),
-          )
-          .pipe(Effect.map(Option.getOrUndefined))
-        const selected = lastPrompt?.info.role === "user" ? lastPrompt.info.model : undefined
-        yield* ops
-          .prompt({
-            sessionID: ctx.sessionID,
-            agent: currentParent.agent ?? ctx.agent,
-            model: selected ? { providerID: selected.providerID, modelID: selected.modelID } : undefined,
-            variant: selected ? selected.variant : variant,
-            parts: [
-              {
-                type: "text",
-                synthetic: true,
-                text: renderOutput({
-                  sessionID: nextSession.id,
-                  state,
-                  summary:
-                    state === "completed"
-                      ? `Background task completed: ${params.description}`
-                      : `Background task failed: ${params.description}`,
-                  text,
-                }),
-              },
-            ],
-          })
-          .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
+        const result: BackgroundResult = {
+          parentSessionID: ctx.sessionID,
+          sessionID: nextSession.id,
+          state,
+          summary:
+            state === "completed"
+              ? "Background task completed: " + params.description
+              : "Background task failed: " + params.description,
+          text,
+          agent: ctx.agent,
+          variant,
+          ops,
+        }
+        const batchMs = flags.backgroundResultBatchMs
+        if (!batchMs) {
+          yield* promptResults([result]).pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
+          return
+        }
+        yield* enqueueBackgroundResult(result, batchMs)
       })
 
       const notify = Effect.fn("TaskTool.notifyBackgroundResult")(function* (jobID: string) {
@@ -268,7 +372,7 @@ export const TaskTool = Tool.define(
           Effect.flatMap((result) => {
             if (result.info?.status === "completed") return inject("completed", result.info.output ?? "")
             if (result.info?.status === "error") return inject("error", result.info.error ?? "")
-            return Effect.void
+            return flushWhenParentIsIdle(ctx.sessionID)
           }),
           Effect.forkIn(scope, { startImmediately: true }),
         )
